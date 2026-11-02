@@ -293,7 +293,7 @@
   <div id="toast"></div>
   <script src="billing-engine.js"></script>
   <script>
-    const API_URL = 'https://script.google.com/macros/s/AKfycbxYLCzbRnX37X7WOfLEH2EUYFKc-ZD3fdTDZw-Xx2MruC-7gxSvjRJALbGyD7GaMv3w8g/exec';   // ← Apps Script web app /exec URL
+    const API_URL = 'https://script.google.com/macros/s/AKfycbxj8sKttshMwgBG04GwGnxmfNAOJ_e1Dv4woWmdwzquXcYDd-DLtKxp788pOC7_lG92/exec';   // ← Apps Script web app /exec URL
     const $ = s => document.querySelector(s), LS = localStorage;
     const J = (k, d) => { try { const v = JSON.parse(LS.getItem(k)); return v == null ? d : v } catch (e) { return d } };
     const S = (k, v) => { try { LS.setItem(k, JSON.stringify(v)) } catch (e) { toast('ගබඩා ඉඩ අවසන්! සමමුහුර්ත කරන්න.') } };
