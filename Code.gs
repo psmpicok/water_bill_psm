@@ -881,7 +881,7 @@ function setupSheets() {
 /** Edit the two constants, run once, then DELETE the PIN from this file. */
 function setupFirstAdmin() {
   const ADMIN_ID = 'admin';
-  const ADMIN_PIN = '';            // ← type a 6-digit PIN here, run, then clear it again
+  const ADMIN_PIN = '123456';            // ← type a 6-digit PIN here, run, then clear it again
   validPin_(ADMIN_PIN);
   withLock_(function () {
     if (tbl_('Users').objs.some(function (o) { return str_(o.User_ID) === ADMIN_ID; })) throw new Error('User already exists');
