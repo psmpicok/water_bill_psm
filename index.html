@@ -1,6 +1,7 @@
 /**
- * Madulla Pradeshiya Sabha — Water Billing Backend (Phase 1, v3 — reviewed & extended)
- * Google Apps Script web app, container-bound to the master Google Sheet.
+ * Madulla Pradeshiya Sabha — Water Billing Backend (v4)
+ * Google Apps Script web app. Works BOTH as a container-bound script (Extensions → Apps Script from the sheet)
+ * AND as a standalone project (it then opens the sheet by ID — see SPREADSHEET_ID_FALLBACK below).
  *
  * Client contract (no preflight, no custom headers):
  *   fetch(WEB_APP_URL, {
@@ -13,35 +14,34 @@
  * Responses: { ok:true, data:{...} }  |  { ok:false, code:'...', message:'...' }
  *
  * FIRST-TIME SETUP:
- *   1. run setupSheets()
- *   2. Project Settings → Script Properties → add SETUP_ADMIN_PIN (6 digits), then run setupFirstAdmin()
+ *   1. run debugSheet()  → the Execution log must show your tabs and the customers it read
+ *   2. run setupSheets()
+ *   3. Project Settings → Script Properties → add SETUP_ADMIN_PIN (6 digits), then run setupFirstAdmin()
  *      (the property is deleted automatically after use; the PIN never lives in source code)
- *   3. run selfTest()
- *   4. Deploy → Web app → Execute as: Me, Who has access: Anyone
+ *   4. run selfTest()
+ *   5. Deploy → New deployment → Web app → Execute as: Me, Who has access: Anyone
+ *      After EVERY later code change: Deploy → Manage deployments → ✏️ → Version: New version → Deploy
  *      (appsscript.json must contain "timeZone": "Asia/Colombo")
+ *   6. Open the /exec URL in a browser: it must show "sheet_connected": true
  *
- * CHANGES vs previous version:
- *   FIXES
- *   - Login lockout logic moved into one helper (verifyUserPin_) so login AND changePin share the same
- *     brute-force protection (a stolen session can no longer guess the old PIN without limit).
- *   - flush_ now writes ONLY Meter_No / Previous_Reading / Arrears_BF (it used to rewrite every column between
- *     them if the sheet columns were reordered). Falls back to per-cell writes when the columns are not adjacent.
- *   - History/last-bill lookups are computed once per customer (readingHist_) — getCollectorData was sorting the
- *     same list 3× per customer. Blank Units cells are no longer read as 0.
- *   - updateSetting: per-key range checks (METER_DIGITS 1–8, etc.), undefined value handled, and a
- *     TARIFF_OVERRIDE_JSON dry-run so a broken override can never be saved and brick billing.
- *   - Audit "Reason" text is formula-injection safe (safeText_).
- *   - getMyPortal ignores rows with unreadable dates instead of crashing on iso_().
- *   - setupSheets no longer stacks a new protection every time it is re-run.
- *   - selfTest: extra cases (faulty estimate, overpayment, replaced meter, rollover).
- *   NEW ACTIONS
- *   - changePin     (Collector / Admin / Consumer: change own PIN)
- *   - upsertCustomer (Admin: create / edit a customer, reason required, audited)
- *   - adjustBalance  (Admin: signed correction to Arrears_BF, reason required, audited)
- *   - listUsers / unlockUser (Admin)
+ * CHANGES in v4 (on top of v3):
+ *   - ss_(): active spreadsheet → Script Property SPREADSHEET_ID → built-in fallback ID. A standalone script no
+ *     longer fails with "cannot read properties of null".
+ *   - doGet health check now reports sheet_connected (true/false) so a wrong binding is visible from a browser.
+ *   - Customers with a BLANK Status are treated as Active (only an explicit "Disconnected" blocks billing).
+ *   - Clear CATEGORY_MISSING / SCHEME_MISSING errors instead of a generic billing error.
+ *   - Blank rows in Customers are ignored; an empty sheet gives a readable error.
+ *   - New editor helpers: debugSheet() (diagnose what the script sees) and fillBlankStatus().
+ *
+ * v3 changes kept: shared PIN lockout (login + changePin), safe flush_, per-account history helper, per-key settings
+ * validation + tariff dry-run, formula-injection-safe audit reasons, idempotent protections, new actions
+ * changePin / upsertCustomer / adjustBalance / listUsers / unlockUser.
  */
 
 // ───────────────────────────── CONFIG ─────────────────────────────
+// Used only when the script is NOT bound to the sheet and no SPREADSHEET_ID Script Property is set.
+const SPREADSHEET_ID_FALLBACK = '1fcJwSPLSaSPK3ETMx4nUube0rzxDL715OwhYEUuD0wY';
+
 const TZ = 'Asia/Colombo';
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;   // absolute session life: 8h
 const CACHE_MAX_SEC = 21600;                  // CacheService hard limit per put (6h) — sessions are re-put on use
@@ -350,8 +350,10 @@ const ROUTES = {
 };
 
 function doGet() {
-  // Health check only — never returns business data.
-  return json_({ ok: true, service: 'Madulla Water Billing API', version: 3, time: iso_(new Date()) });
+  // Health check only — never returns business data. sheet_connected tells you if the script can reach the sheet.
+  let connected = false;
+  try { connected = !!ss_().getSheetByName('Customers'); } catch (e) { connected = false; }
+  return json_({ ok: true, service: 'Madulla Water Billing API', version: 4, sheet_connected: connected, time: iso_(new Date()) });
 }
 
 function doPost(e) {
@@ -385,7 +387,22 @@ function errOut_(err) {
   console.error(err && err.stack ? err.stack : String(err));
   return { ok: false, code: 'INTERNAL', message: 'Server error' };
 }
-function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
+
+/**
+ * The spreadsheet, in this order:
+ *   1. the sheet this script is bound to (Extensions → Apps Script)
+ *   2. Script Property SPREADSHEET_ID
+ *   3. SPREADSHEET_ID_FALLBACK constant at the top of this file
+ */
+let _ssCache = null;
+function ss_() {
+  if (_ssCache) return _ssCache;
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) return (_ssCache = active);
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID') || SPREADSHEET_ID_FALLBACK;
+  if (!id) throw new Error('Script is not bound to a sheet and no SPREADSHEET_ID is configured.');
+  return (_ssCache = SpreadsheetApp.openById(id));
+}
 function str_(v) { return (v === null || v === undefined) ? '' : String(v).trim(); }
 function num_(v) { return (v === null || v === undefined || v === '' || typeof v === 'boolean') ? NaN : Number(v); }
 function r2_(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
@@ -427,12 +444,15 @@ function needReason_(d) {
   if (!r) throw bizErr_('REASON_REQUIRED', 'A reason is required for this change');
   return r;
 }
+/** A blank Status cell counts as Active; only an explicit "Disconnected" blocks billing. */
+function custStatus_(o) { const s = str_(o.Status); return s === '' ? 'Active' : s; }
 
 // ── sheet access ──
 function tbl_(name) {
   const sh = ss_().getSheetByName(name);
   if (!sh) throw new Error('Missing sheet: ' + name + ' (run setupSheets)');
   const lastCol = sh.getLastColumn(), lastRow = sh.getLastRow();
+  if (lastCol < 1) throw new Error('Sheet ' + name + ' is empty — it needs a header row (run setupSheets)');
   const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h).trim(); });
   const col = {}; headers.forEach(function (h, i) { col[h] = i; });
   SCHEMA[name].forEach(function (h) { if (!(h in col)) throw new Error('Sheet ' + name + ' is missing column ' + h); });
@@ -567,7 +587,7 @@ function makeCtx_() { return { settings: getSettings_(), audits: [] }; }
 function loadCustomers_(ctx) {
   if (ctx.C) return ctx.C;
   const t = tbl_('Customers'), map = new Map();
-  t.objs.forEach(function (o) { o.Account_No = str_(o.Account_No); map.set(o.Account_No, o); });
+  t.objs.forEach(function (o) { o.Account_No = str_(o.Account_No); if (o.Account_No) map.set(o.Account_No, o); });   // blank rows ignored
   return (ctx.C = { t: t, map: map, dirty: new Set() });
 }
 function loadReadings_(ctx) {
@@ -658,6 +678,8 @@ function overdueArgs_(R, acct, ts) {   // arrears age = days since the previous 
 }
 function calcBill_(ctx, cust, input, ts) {
   const s = ctx.settings, R = loadReadings_(ctx), acct = cust.Account_No, warnings = [];
+  if (CATEGORIES.indexOf(str_(cust.Category)) < 0) throw bizErr_('CATEGORY_MISSING', 'Customer ' + acct + ' has no Category (Domestic / Commercial). Fix it in the Customers sheet.');
+  if (SCHEMES.indexOf(str_(cust.Scheme)) < 0) throw bizErr_('SCHEME_MISSING', 'Customer ' + acct + ' has no valid Scheme. Fix it in the Customers sheet.');
   const hist = readingHist_(R, acct).units3;
   const prev = Number(cust.Previous_Reading) || 0, arrears = Number(cust.Arrears_BF) || 0;
   let r;
@@ -690,7 +712,7 @@ function processReading_(ctx, it, user) {
   if (dup) return { type: 'reading', uuid: uuid, status: 'duplicate', account_no: dup.Account_No, units: Number(dup.Units), billed_amount: Number(dup.Billed_Amount) };
   const C = loadCustomers_(ctx), cust = C.map.get(acct);
   if (!cust) throw bizErr_('CUSTOMER_NOT_FOUND', 'Account not found');
-  if (str_(cust.Status) !== 'Active') throw bizErr_('CUSTOMER_DISCONNECTED', 'Customer is not Active');
+  if (custStatus_(cust) !== 'Active') throw bizErr_('CUSTOMER_DISCONNECTED', 'Customer is not Active');
   const ts = pickTs_(it.timestamp), mk = monthKey_(ts);
   if (R.months.has(acct + '|' + mk)) throw bizErr_('ALREADY_READ', 'A reading already exists for this account this month');
   const input = parseReadingInput_(it), b = calcBill_(ctx, cust, input, ts);
@@ -778,7 +800,7 @@ function actCollectorData_() {
     const a = h.units3.length ? h.units3.reduce(function (s, x) { return s + x; }, 0) / h.units3.length : null;
     customers.push({ Account_No: o.Account_No, Name: str_(o.Name), Address: str_(o.Address), Phone: str_(o.Phone), Scheme: str_(o.Scheme),
       Category: str_(o.Category), Route_Order: Number(o.Route_Order) || 0, Meter_No: str_(o.Meter_No), Previous_Reading: Number(o.Previous_Reading) || 0,
-      Arrears_BF: Number(o.Arrears_BF) || 0, Status: str_(o.Status), GPS_Lat: o.GPS_Lat, GPS_Lng: o.GPS_Lng,
+      Arrears_BF: Number(o.Arrears_BF) || 0, Status: custStatus_(o), GPS_Lat: o.GPS_Lat, GPS_Lng: o.GPS_Lng,
       read_this_month: R.months.has(o.Account_No + '|' + mk), avg_units_3: a === null ? null : Math.round(a),
       history_units: h.units3,
       last_billed_date: h.last ? Utilities.formatDate(h.last.Timestamp, TZ, 'yyyy-MM-dd') : '' });
@@ -807,7 +829,7 @@ function actMyPortal_(sess) {
   const next = comps.length ? comps[0].ts.getTime() + cdH * 3600000 : 0;
   return {
     account: { Account_No: acct, Name: str_(cust.Name), Address: str_(cust.Address), Scheme: str_(cust.Scheme), Category: str_(cust.Category),
-      Meter_No: str_(cust.Meter_No), Previous_Reading: Number(cust.Previous_Reading) || 0, Balance: Number(cust.Arrears_BF) || 0, Status: str_(cust.Status) },
+      Meter_No: str_(cust.Meter_No), Previous_Reading: Number(cust.Previous_Reading) || 0, Balance: Number(cust.Arrears_BF) || 0, Status: custStatus_(cust) },
     readings: readings, payments: payments,
     complaints: comps.map(function (x) { return { ID: x.ID, Type: x.Type, Status: x.Status, Created_At: iso_(x.ts) }; }),
     complaint_available_at: next > Date.now() ? iso_(new Date(next)) : null
@@ -843,7 +865,7 @@ function actDashboard_() {
     if (monthKey_(x.Timestamp) === mk) collected += a;
     if (dayKey_(x.Timestamp) === dk) today[x.Collector_ID] = r2_((today[x.Collector_ID] || 0) + a);
   });
-  C.map.forEach(function (o) { if (str_(o.Status) === 'Active') active++; const a = Number(o.Arrears_BF) || 0; if (a > 0) arrears += a; });
+  C.map.forEach(function (o) { if (custStatus_(o) === 'Active') active++; const a = Number(o.Arrears_BF) || 0; if (a > 0) arrears += a; });
   tbl_('Complaints').objs.forEach(function (o) { if (comp[str_(o.Status)] !== undefined) comp[str_(o.Status)]++; });
   return { month: mk, active_customers: active, readings_this_month: readCount, billed_this_month: r2_(billed),
     collected_this_month: r2_(collected), total_arrears: r2_(arrears), cash_by_collector_today: today, complaints: comp };
@@ -1021,7 +1043,41 @@ function actUpdateSetting_(sess, d) {
   });
 }
 
-// ───────────────────────────── ONE-TIME SETUP (run from the editor) ─────────────────────────────
+// ───────────────────────────── ONE-TIME SETUP / DIAGNOSTICS (run from the editor) ─────────────────────────────
+/**
+ * Run this FIRST. Shows which spreadsheet the script is using, the tabs it finds, and for every customer whether
+ * it can be billed. Read the result in the Execution log.
+ */
+function debugSheet() {
+  const s = ss_();
+  const bound = !!SpreadsheetApp.getActiveSpreadsheet();
+  console.log('Spreadsheet: "' + s.getName() + '" (' + (bound ? 'script is bound to it' : 'opened by ID — script is standalone') + ')');
+  console.log('Tabs: ' + s.getSheets().map(function (x) { return x.getName(); }).join(', '));
+
+  const c = tbl_('Customers');
+  const rows = c.objs.filter(function (o) { return str_(o.Account_No) !== ''; });
+  console.log('Customers read: ' + rows.length);
+  rows.forEach(function (o) {
+    const problems = [];
+    if (custStatus_(o) === 'Disconnected') problems.push('Status=Disconnected');
+    if (CATEGORIES.indexOf(str_(o.Category)) < 0) problems.push('Category missing/invalid');
+    if (SCHEMES.indexOf(str_(o.Scheme)) < 0) problems.push('Scheme missing/invalid');
+    console.log('  Acct "' + str_(o.Account_No) + '" ' + str_(o.Name) + ' → ' + (problems.length ? 'PROBLEM: ' + problems.join(', ') : 'OK (can be billed)'));
+  });
+
+  const u = tbl_('Users');
+  const admins = u.objs.filter(function (o) { return str_(o.Role) === 'Admin'; }).length;
+  console.log('Users: ' + u.objs.length + ' (admins: ' + admins + ')' + (admins ? '' : '  → run setupFirstAdmin()'));
+  console.log('PIN_PEPPER: ' + (PropertiesService.getScriptProperties().getProperty('PIN_PEPPER') ? 'set' : 'MISSING → run setupSheets()'));
+}
+
+/** Optional: writes Status = Active into every Customers row whose Status is blank. */
+function fillBlankStatus() {
+  const t = tbl_('Customers'); let n = 0;
+  t.objs.forEach(function (o) { if (str_(o.Account_No) && !str_(o.Status)) { setCell_(t, o, 'Status', 'Active'); n++; } });
+  console.log('Set Status = Active on ' + n + ' customer row(s).');
+}
+
 /** Run ONCE if you already ran an older setup: swaps the old rate settings for the new ones and widens the Status dropdown. */
 function migrateToPhase3() {
   const t = tbl_('Settings'), drop = /^(SLABS_|FIXED_CHARGE_|WARRANT_PCT|FALLBACK_ESTIMATE_UNITS)/;
@@ -1139,6 +1195,10 @@ function selfTest() {
   try { validateTariffOverride_('{"slabs":{"Domestic":[{"upto":5,"rate":10}]}}'); } catch (e) { okBad = true; }   // last slab must be upto:null
   eq('Valid override accepted', okGood, true);
   eq('Broken override rejected', okBad, true);
+
+  // Blank Status counts as Active; explicit Disconnected does not
+  eq('Blank status = Active', custStatus_({ Status: '' }), 'Active');
+  eq('Disconnected stays', custStatus_({ Status: 'Disconnected' }), 'Disconnected');
 
   const h = hashPin_('483920');
   eq('pin ok', verifyPin_('483920', h), true);
